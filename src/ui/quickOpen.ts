@@ -1,3 +1,4 @@
+import { scoreTokens } from '../util/fuzzy';
 import type { Panel } from '../workspace/types';
 
 export interface QuickOpenOptions {
@@ -27,50 +28,6 @@ const TEMPLATE = `
     </div>
   </div>
 `;
-
-/** Subsequence score that rewards contiguous and word-boundary matches. */
-function scoreSubsequence(path: string, needle: string): number {
-  const haystack = path.toLowerCase();
-  let hayIndex = 0;
-  let needleIndex = 0;
-  let score = 0;
-  let lastMatch = -2;
-
-  while (hayIndex < haystack.length && needleIndex < needle.length) {
-    if (haystack[hayIndex] === needle[needleIndex]) {
-      score += lastMatch === hayIndex - 1 ? 9 : 2;
-      const previous = haystack[hayIndex - 1];
-      if (
-        hayIndex === 0 ||
-        previous === '/' ||
-        previous === '-' ||
-        previous === '_' ||
-        previous === '.'
-      ) {
-        score += 5;
-      }
-      lastMatch = hayIndex;
-      needleIndex += 1;
-    }
-    hayIndex += 1;
-  }
-
-  if (needleIndex !== needle.length) return -1;
-  return score - haystack.length * 0.01;
-}
-
-/** Every whitespace-separated token must match somewhere in the path. */
-function scorePath(path: string, query: string): number {
-  if (!query) return 0;
-  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
-  let total = 0;
-  for (const token of tokens) {
-    const score = scoreSubsequence(path, token);
-    if (score < 0) return -1;
-    total += score;
-  }
-  return total / tokens.length;
-}
 
 export function createQuickOpen(options: QuickOpenOptions): QuickOpen {
   const container = document.createElement('div');
@@ -139,7 +96,7 @@ export function createQuickOpen(options: QuickOpenOptions): QuickOpen {
     const query = input.value.trim();
     results = options
       .getPanels()
-      .map((panel) => ({ panel, score: scorePath(panel.path, query) }))
+      .map((panel) => ({ panel, score: scoreTokens(panel.path, query) }))
       .filter((item) => item.score >= 0)
       .sort((a, b) => {
         if (b.score !== a.score) return b.score - a.score;

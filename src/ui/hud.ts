@@ -66,6 +66,7 @@ const TEMPLATE = `
     <span><kbd>F2</kbd> rename</span>
     <span><kbd>del</kbd> delete</span>
     <span><kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>f</kbd> search</span>
+    <span><kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>p</kbd> commands</span>
     <span><kbd>ctrl</kbd>+<kbd>p</kbd> go to file</span>
     <span><kbd>ctrl</kbd>+<kbd>s</kbd> save</span>
     <span><kbd>0</kbd> fit</span>

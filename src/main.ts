@@ -7,6 +7,7 @@ import { SpatialHash } from './scene/spatial';
 import { Renderer } from './render/renderer';
 import { loadSession, saveSession } from './session/session';
 import { TokenStore } from './tokens/tokenStore';
+import { createCommandPalette } from './ui/commandPalette';
 import { createHud } from './ui/hud';
 import { createLoadingOverlay } from './ui/loading';
 import { createMinimap } from './ui/minimap';
@@ -41,6 +42,7 @@ function buildSpatial(workspace: Workspace): SpatialHash {
 let workspace = createMockWorkspace();
 let spatial = buildSpatial(workspace);
 let provider: WorkspaceProvider = new MockProvider(workspace);
+let storedHandle: FileSystemDirectoryHandle | null = null;
 
 const camera = new Camera();
 const tokens = new TokenStore((path) => provider.readText(path));
@@ -96,6 +98,122 @@ const search = createSearch({
   onPick: (panel, line, column) => activatePanel(panel, { line, column }),
 });
 
+const commandPalette = createCommandPalette({
+  getCommands: () => {
+    const isFs = provider instanceof FsAccessProvider;
+    const hasSelection = input.selectedId >= 0;
+    const handle = storedHandle;
+    return [
+      {
+        id: 'open-folder',
+        title: 'Open folder…',
+        detail: 'Choose a folder from disk',
+        run: openFolder,
+      },
+      ...(handle
+        ? [
+            {
+              id: 'reopen-folder',
+              title: `Reopen ${handle.name}`,
+              detail: 'Request access to the last folder',
+              run: () => {
+                void openDirectoryHandle(handle, true);
+              },
+            },
+          ]
+        : []),
+      {
+        id: 'refresh',
+        title: 'Refresh workspace',
+        detail: 'Rescan the open folder',
+        enabled: () => isFs,
+        run: () => {
+          void refreshWorkspace();
+        },
+      },
+      {
+        id: 'new-file',
+        title: 'New file…',
+        shortcut: 'n',
+        enabled: () => isFs,
+        run: createNewFile,
+      },
+      {
+        id: 'rename-file',
+        title: 'Rename selected file…',
+        shortcut: 'F2',
+        enabled: () => isFs && hasSelection,
+        run: renameSelectedFile,
+      },
+      {
+        id: 'delete-file',
+        title: 'Delete selected file',
+        shortcut: 'del',
+        enabled: () => isFs && hasSelection,
+        run: deleteSelectedFile,
+      },
+      {
+        id: 'go-to-file',
+        title: 'Go to file…',
+        shortcut: 'ctrl+p',
+        run: () => quickOpen.open(),
+      },
+      {
+        id: 'search',
+        title: 'Search in files…',
+        shortcut: 'ctrl+shift+f',
+        run: () => search.open(),
+      },
+      {
+        id: 'save',
+        title: 'Save file',
+        shortcut: 'ctrl+s',
+        enabled: () => editor.isOpen,
+        run: () => {
+          void editor.save();
+        },
+      },
+      {
+        id: 'close-editor',
+        title: 'Close editor',
+        shortcut: 'esc',
+        enabled: () => editor.isOpen,
+        run: () => editor.close(),
+      },
+      {
+        id: 'fit',
+        title: 'Fit workspace',
+        shortcut: '0',
+        run: () => camera.focusRect(workspace.bounds, 72),
+      },
+      {
+        id: 'zoom-100',
+        title: 'Zoom to 100%',
+        shortcut: '1',
+        run: () => camera.setZoomAt(camera.vw / 2, camera.vh / 2, 1),
+      },
+      {
+        id: 'center-selection',
+        title: 'Center on selection',
+        enabled: () => hasSelection,
+        run: () => {
+          const panel = input.selectedId >= 0 ? workspace.panels[input.selectedId] : null;
+          if (panel) camera.focusRect(panel, 72);
+        },
+      },
+      {
+        id: 'clear-selection',
+        title: 'Clear selection',
+        shortcut: 'esc',
+        enabled: () => hasSelection,
+        run: () => {
+          input.selectedId = -1;
+        },
+      },
+    ];
+  },
+});
+
 /** Camera flight plus editor mount, shared by double-click and quick-open. */
 function activatePanel(panel: Panel, focus?: EditorFocus): void {
   input.selectedId = panel.id;
@@ -117,7 +235,8 @@ window.addEventListener(
     if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
     if (event.key.toLowerCase() !== 'p') return;
     event.preventDefault();
-    if (search.isOpen) search.close();
+    search.close();
+    commandPalette.close();
     if (quickOpen.isOpen) quickOpen.close();
     else quickOpen.open();
   },
@@ -130,11 +249,24 @@ window.addEventListener(
     if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
     if (!event.shiftKey || event.key.toLowerCase() !== 'f') return;
     event.preventDefault();
+    quickOpen.close();
+    commandPalette.close();
     if (search.isOpen) search.close();
-    else {
-      quickOpen.close();
-      search.open();
-    }
+    else search.open();
+  },
+  { capture: true },
+);
+
+window.addEventListener(
+  'keydown',
+  (event) => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    if (!event.shiftKey || event.key.toLowerCase() !== 'p') return;
+    event.preventDefault();
+    quickOpen.close();
+    search.close();
+    if (commandPalette.isOpen) commandPalette.close();
+    else commandPalette.open();
   },
   { capture: true },
 );
@@ -142,7 +274,7 @@ window.addEventListener(
 // File operations only fire from the canvas, never while typing or searching.
 window.addEventListener('keydown', (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-  if (quickOpen.isOpen || isEditableTarget(event.target)) return;
+  if (quickOpen.isOpen || commandPalette.isOpen || isEditableTarget(event.target)) return;
   if (!(provider instanceof FsAccessProvider)) return;
 
   if (event.key === 'n' || event.key === 'N') {
@@ -257,6 +389,7 @@ async function openDirectoryHandle(
     });
 
     applyWorkspace(nextWorkspace, nextProvider);
+    storedHandle = handle;
     await saveDirectoryHandle(handle);
     hud.setReopenFolder(handle.name, () => {
       void openDirectoryHandle(handle, true);
@@ -289,6 +422,7 @@ async function openFolder(): Promise<void> {
 async function bootStoredFolder(): Promise<void> {
   const handle = await loadDirectoryHandle();
   if (!handle) return;
+  storedHandle = handle;
 
   hud.setReopenFolder(handle.name, () => {
     void openDirectoryHandle(handle, true);
@@ -301,8 +435,16 @@ async function bootStoredFolder(): Promise<void> {
 
 let refreshing = false;
 
+interface RefreshOptions {
+  /** Background sync skips the blocking overlay and fails quietly. */
+  quiet?: boolean;
+}
+
 /** Rescans the active folder, keeping the camera and selected file stable. */
-async function refreshWorkspace(focusPath?: string): Promise<boolean> {
+async function refreshWorkspace(
+  focusPath?: string,
+  options: RefreshOptions = {},
+): Promise<boolean> {
   const currentProvider = provider;
   if (refreshing || !(currentProvider instanceof FsAccessProvider)) return false;
 
@@ -314,27 +456,63 @@ async function refreshWorkspace(focusPath?: string): Promise<boolean> {
     focusPath,
     openPath: editor.openPanel?.path ?? null,
   };
-  loading.show('Refreshing workspace', `Scanning ${currentProvider.name}…`);
+  if (!options.quiet) {
+    loading.show('Refreshing workspace', `Scanning ${currentProvider.name}…`);
+  }
   try {
     const nextWorkspace = await currentProvider.load((progress) => {
-      loading.setDetail(workspaceScanDetail(progress));
+      if (!options.quiet) loading.setDetail(workspaceScanDetail(progress));
     });
     if (provider !== currentProvider) {
-      loading.hide();
+      if (!options.quiet) loading.hide();
       return false;
     }
 
     applyWorkspace(nextWorkspace, currentProvider, view);
-    loading.hide();
+    if (!options.quiet) loading.hide();
     return true;
   } catch (error) {
     console.error(error);
+    if (options.quiet) return false;
     loading.fail(error instanceof Error ? error.message : 'Unknown error');
     return false;
   } finally {
     refreshing = false;
   }
 }
+
+let focusSyncAt = 0;
+let focusSyncing = false;
+
+/** Quietly rescans when the window regains focus and the folder changed. */
+async function syncWorkspaceOnFocus(): Promise<void> {
+  const currentProvider = provider;
+  if (!(currentProvider instanceof FsAccessProvider)) return;
+  if (document.visibilityState !== 'visible') return;
+  if (focusSyncing || refreshing || loading.isOpen) return;
+
+  const now = performance.now();
+  if (now - focusSyncAt < 2000) return;
+  focusSyncAt = now;
+  focusSyncing = true;
+  try {
+    if (await currentProvider.changedSinceLoad()) {
+      if (provider === currentProvider) await refreshWorkspace(undefined, { quiet: true });
+    }
+  } catch (error) {
+    console.warn('Workspace focus sync failed', error);
+  } finally {
+    focusSyncing = false;
+  }
+}
+
+window.addEventListener('focus', () => {
+  void syncWorkspaceOnFocus();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') void syncWorkspaceOnFocus();
+});
 
 function normalizeFilePath(raw: string): string | null {
   const path = raw
@@ -460,6 +638,7 @@ if (import.meta.env.DEV) {
     tokens,
     quickOpen,
     search,
+    commandPalette,
     openFolder,
     openDirectoryHandle,
     bootStoredFolder,

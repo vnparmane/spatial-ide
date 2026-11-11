@@ -244,12 +244,29 @@ async function scanFiles(
   return files;
 }
 
+/** Order-independent metadata fingerprint used to detect external changes. */
+function signatureOf(files: readonly ScannedFile[]): string {
+  let hash = 0x811c9dc5;
+  for (const file of files) {
+    for (let i = 0; i < file.path.length; i += 1) {
+      hash ^= file.path.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    hash ^= file.size;
+    hash = Math.imul(hash, 0x01000193);
+    hash ^= file.mtime >>> 0;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${files.length}:${hash >>> 0}`;
+}
+
 export class FsAccessProvider implements WorkspaceProvider {
   readonly name: string;
   private readonly root: FileSystemDirectoryHandle;
   private readonly handles = new Map<string, FileSystemFileHandle>();
   private gitIndex: Map<string, GitIndexEntry> | null = null;
   private hasGit = false;
+  private loadedSignature = '';
 
   constructor(root: FileSystemDirectoryHandle) {
     this.root = root;
@@ -285,6 +302,7 @@ export class FsAccessProvider implements WorkspaceProvider {
     this.hasGit = index !== null;
 
     scanned.sort((a, b) => a.path.localeCompare(b.path));
+    this.loadedSignature = signatureOf(scanned);
 
     const groupsByPath = new Map<string, Group>();
     const panels: Panel[] = [];
@@ -349,6 +367,18 @@ export class FsAccessProvider implements WorkspaceProvider {
       groups: groupList,
       bounds,
     };
+  }
+
+  /**
+   * Walks metadata only (no file contents) to detect files added, removed, or
+   * changed since the last load. Used for quiet sync when the window regains
+   * focus.
+   */
+  async changedSinceLoad(): Promise<boolean> {
+    if (!this.loadedSignature) return true;
+    const files = await scanFiles(this.root);
+    files.sort((a, b) => a.path.localeCompare(b.path));
+    return signatureOf(files) !== this.loadedSignature;
   }
 
   async stat(path: string): Promise<{ mtime: number; size: number } | null> {

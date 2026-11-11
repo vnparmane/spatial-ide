@@ -3,6 +3,7 @@ export interface LoadingOverlay {
   setDetail(detail: string): void;
   hide(): void;
   fail(message: string): void;
+  readonly isOpen: boolean;
 }
 
 const TEMPLATE = `
@@ -59,6 +60,10 @@ export function createLoadingOverlay(): LoadingOverlay {
       close.hidden = false;
       title.textContent = 'Could not open folder';
       detail.textContent = message;
+    },
+
+    get isOpen(): boolean {
+      return !root.hidden;
     },
   };
 }
