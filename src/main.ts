@@ -1,4 +1,5 @@
 import './style.css';
+import { SemanticStore } from './diagnostics/semanticStore';
 import { DraftStore } from './editor/draftStore';
 import { EditorOverlay, type EditorFocus } from './editor/editorOverlay';
 import { InputController, isEditableTarget } from './input/input';
@@ -46,6 +47,8 @@ let storedHandle: FileSystemDirectoryHandle | null = null;
 
 const camera = new Camera();
 const tokens = new TokenStore((path) => provider.readText(path));
+const semantics = new SemanticStore((path) => provider.readText(path));
+semantics.onDiagnostics((path, diagnostics) => tokens.setSemantic(path, diagnostics));
 const renderer = new Renderer(canvas, workspace, spatial, tokens);
 const input = new InputController(canvas, camera, workspace, spatial);
 const loading = createLoadingOverlay();
@@ -69,15 +72,20 @@ const editor = new EditorOverlay({
     const panel = workspace.panels.find((candidate) => candidate.path === path);
     if (!panel) return;
     tokens.set(panel.path, panel.language, content);
+    semantics.update(panel.path, panel.language, content);
     const status = await provider.gitStatus?.(path, content);
     if (status) panel.git = status;
   },
   stat: (path) => provider.stat?.(path) ?? Promise.resolve(undefined),
   getDiagnostics: (path) => tokens.getDiagnostics(path),
-  onDocSettled: (panel, text) => tokens.set(panel.path, panel.language, text),
+  onDocSettled: (panel, text) => {
+    tokens.set(panel.path, panel.language, text);
+    semantics.update(panel.path, panel.language, text);
+  },
   onDirtyChange: () => {},
   onContentReplaced: (panel, text) => {
     tokens.set(panel.path, panel.language, text);
+    semantics.update(panel.path, panel.language, text);
     void provider.gitStatus?.(panel.path, text).then((status) => {
       if (status) panel.git = status;
     });
@@ -329,6 +337,7 @@ function applyWorkspace(
   editor.reset();
   editor.setDraftPersistence(new DraftStore(nextWorkspace.rootPath));
   tokens.reset();
+  semantics.reset();
   provider = nextProvider;
   workspace = nextWorkspace;
   spatial = buildSpatial(workspace);
@@ -636,6 +645,7 @@ if (import.meta.env.DEV) {
     minimap,
     editor,
     tokens,
+    semantics,
     quickOpen,
     search,
     commandPalette,

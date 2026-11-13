@@ -19,6 +19,7 @@ export class TokenStore {
   private readonly worker: Worker | null;
   private readonly cache = new Map<string, TokenRun[]>();
   private readonly diagnosticCache = new Map<string, Diagnostic[]>();
+  private readonly semanticCache = new Map<string, Diagnostic[]>();
   private readonly diagnosticListeners = new Set<
     (path: string, diagnostics: readonly Diagnostic[]) => void
   >();
@@ -49,7 +50,15 @@ export class TokenStore {
   }
 
   getDiagnostics(path: string): readonly Diagnostic[] | null {
-    return this.diagnosticCache.get(path) ?? null;
+    if (!this.diagnosticCache.has(path) && !this.semanticCache.has(path)) return null;
+    return this.mergedDiagnostics(path);
+  }
+
+  /** Merges language-service diagnostics with the latest tree-sitter parse. */
+  setSemantic(path: string, diagnostics: readonly Diagnostic[]): void {
+    if (diagnostics.length === 0) this.semanticCache.delete(path);
+    else this.semanticCache.set(path, [...diagnostics]);
+    this.notify(path);
   }
 
   /** Subscribes to diagnostic updates; returns an unsubscribe function. */
@@ -91,6 +100,7 @@ export class TokenStore {
     this.generation += 1;
     this.cache.clear();
     this.diagnosticCache.clear();
+    this.semanticCache.clear();
     this.pending.clear();
     this.requestPaths.clear();
     this.latest.clear();
@@ -129,17 +139,24 @@ export class TokenStore {
       console.warn(`Tokenize failed for ${path}: ${response.error}`);
       this.cache.set(path, []);
       this.diagnosticCache.set(path, []);
-      this.notify(path, []);
+      this.notify(path);
       return;
     }
 
     this.cache.set(path, response.runs);
-    const diagnostics = response.diagnostics ?? [];
-    this.diagnosticCache.set(path, diagnostics);
-    this.notify(path, diagnostics);
+    this.diagnosticCache.set(path, response.diagnostics ?? []);
+    this.notify(path);
   }
 
-  private notify(path: string, diagnostics: readonly Diagnostic[]): void {
+  private mergedDiagnostics(path: string): Diagnostic[] {
+    return [
+      ...(this.diagnosticCache.get(path) ?? []),
+      ...(this.semanticCache.get(path) ?? []),
+    ];
+  }
+
+  private notify(path: string): void {
+    const diagnostics = this.mergedDiagnostics(path);
     for (const listener of this.diagnosticListeners) {
       listener(path, diagnostics);
     }

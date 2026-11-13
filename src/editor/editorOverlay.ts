@@ -399,7 +399,7 @@ export class EditorOverlay {
     this.shell.hidden = false;
     panel.lines = this.view.state.doc.lines;
     this.applyDiagnostics(panel.path, this.callbacks.getDiagnostics?.(panel.path) ?? []);
-    if (this.dirty) this.callbacks.onDocSettled?.(panel, doc);
+    this.callbacks.onDocSettled?.(panel, doc);
     this.refreshStatus();
     this.updateMeta();
     this.updateDirtyIndicator();
@@ -424,7 +424,7 @@ export class EditorOverlay {
     view.dispatch({ selection: { anchor: line.from + column }, scrollIntoView: true });
   }
 
-  /** Applies the latest tree-sitter diagnostics for the open document. */
+  /** Applies the latest merged syntax and semantic diagnostics. */
   setDiagnostics(path: string, diagnostics: readonly Diagnostic[]): void {
     if (this.panel?.path !== path || !this.view) return;
     this.applyDiagnostics(path, diagnostics);
@@ -453,7 +453,7 @@ export class EditorOverlay {
         to: Math.max(from, to),
         severity: diagnostic.severity,
         message: diagnostic.message,
-        source: 'tree-sitter',
+        source: 'spatial',
       });
     }
     view.dispatch(setLintDiagnostics(view.state, mapped));
