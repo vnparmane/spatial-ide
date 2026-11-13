@@ -15,6 +15,7 @@ import { createMinimap } from './ui/minimap';
 import { createQuickOpen } from './ui/quickOpen';
 import { createSearch } from './ui/search';
 import { formatInt } from './util/math';
+import { watchDirectory, type DirectoryWatcher } from './workspace/dirWatcher';
 import { FsAccessProvider } from './workspace/fsAccess';
 import {
   directoryPermission,
@@ -44,6 +45,9 @@ let workspace = createMockWorkspace();
 let spatial = buildSpatial(workspace);
 let provider: WorkspaceProvider = new MockProvider(workspace);
 let storedHandle: FileSystemDirectoryHandle | null = null;
+let watchedProvider: FsAccessProvider | null = null;
+let dirWatcher: DirectoryWatcher | null = null;
+let syncTimer: number | null = null;
 
 const camera = new Camera();
 const tokens = new TokenStore((path) => provider.readText(path));
@@ -339,6 +343,8 @@ function applyWorkspace(
   tokens.reset();
   semantics.reset();
   provider = nextProvider;
+  syncDirectoryWatcher();
+  structureSyncAt = 0;
   workspace = nextWorkspace;
   spatial = buildSpatial(workspace);
 
@@ -481,8 +487,8 @@ async function refreshWorkspace(
     if (!options.quiet) loading.hide();
     return true;
   } catch (error) {
-    console.error(error);
     if (options.quiet) return false;
+    console.error(error);
     loading.fail(error instanceof Error ? error.message : 'Unknown error');
     return false;
   } finally {
@@ -490,37 +496,72 @@ async function refreshWorkspace(
   }
 }
 
-let focusSyncAt = 0;
-let focusSyncing = false;
+let structureSyncAt = 0;
+let structureSyncing = false;
 
-/** Quietly rescans when the window regains focus and the folder changed. */
-async function syncWorkspaceOnFocus(): Promise<void> {
+function scheduleWorkspaceSync(): void {
+  if (syncTimer !== null) window.clearTimeout(syncTimer);
+  syncTimer = window.setTimeout(() => {
+    syncTimer = null;
+    void syncWorkspaceStructure();
+  }, 250);
+}
+
+/** Attaches a directory observer to the active real folder, if supported. */
+function syncDirectoryWatcher(): void {
+  const currentProvider = provider;
+  if (currentProvider === watchedProvider) return;
+
+  dirWatcher?.dispose();
+  dirWatcher = null;
+  watchedProvider = null;
+
+  if (!(currentProvider instanceof FsAccessProvider)) return;
+  watchedProvider = currentProvider;
+  dirWatcher = watchDirectory(currentProvider.directory, scheduleWorkspaceSync);
+}
+
+/** Quietly syncs panels when the folder changes on disk. */
+async function syncWorkspaceStructure(force = false): Promise<void> {
   const currentProvider = provider;
   if (!(currentProvider instanceof FsAccessProvider)) return;
   if (document.visibilityState !== 'visible') return;
-  if (focusSyncing || refreshing || loading.isOpen) return;
+  if (structureSyncing || refreshing || loading.isOpen) return;
 
   const now = performance.now();
-  if (now - focusSyncAt < 2000) return;
-  focusSyncAt = now;
-  focusSyncing = true;
+  if (!force && now - structureSyncAt < 1200) return;
+  structureSyncAt = now;
+  structureSyncing = true;
   try {
-    if (await currentProvider.changedSinceLoad()) {
-      if (provider === currentProvider) await refreshWorkspace(undefined, { quiet: true });
+    const change = await currentProvider.detectChanges();
+    if (!change || provider !== currentProvider) return;
+
+    const openPath = editor.openPanel?.path ?? null;
+    const onlyOpenFile =
+      openPath !== null &&
+      change.added.length === 0 &&
+      change.removed.length === 0 &&
+      change.modified.length > 0 &&
+      change.modified.every((path) => path === openPath);
+
+    if (onlyOpenFile && (await currentProvider.acceptFileChange(openPath))) {
+      return;
     }
+
+    await refreshWorkspace(undefined, { quiet: true });
   } catch (error) {
-    console.warn('Workspace focus sync failed', error);
+    console.warn('Workspace live sync failed', error);
   } finally {
-    focusSyncing = false;
+    structureSyncing = false;
   }
 }
 
 window.addEventListener('focus', () => {
-  void syncWorkspaceOnFocus();
+  void syncWorkspaceStructure(true);
 });
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') void syncWorkspaceOnFocus();
+  if (document.visibilityState === 'visible') void syncWorkspaceStructure(true);
 });
 
 function normalizeFilePath(raw: string): string | null {
@@ -638,6 +679,10 @@ if (import.meta.env.DEV) {
     get provider() {
       return provider;
     },
+    get dirWatcher() {
+      return dirWatcher;
+    },
+    syncWorkspaceStructure,
     camera,
     renderer,
     input,
@@ -681,6 +726,7 @@ let frameMs = 0;
 let hudTimer = 0;
 let sessionTimer = 0;
 let watchTimer = 0;
+let structureWatchTimer = 0;
 
 function frame(now: number): void {
   const dt = Math.min(0.1, Math.max(0, (now - lastTime) / 1000));
@@ -698,6 +744,13 @@ function frame(now: number): void {
   if (watchTimer >= 1.5) {
     watchTimer = 0;
     if (document.visibilityState === 'visible') void editor.pollExternal();
+  }
+
+  structureWatchTimer += dt;
+  const structureInterval = workspace.panels.length > 1500 ? 4 : 1.5;
+  if (!dirWatcher?.active && structureWatchTimer >= structureInterval) {
+    structureWatchTimer = 0;
+    if (document.visibilityState === 'visible') void syncWorkspaceStructure();
   }
 
   const start = performance.now();

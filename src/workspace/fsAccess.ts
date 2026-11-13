@@ -244,20 +244,19 @@ async function scanFiles(
   return files;
 }
 
-/** Order-independent metadata fingerprint used to detect external changes. */
-function signatureOf(files: readonly ScannedFile[]): string {
-  let hash = 0x811c9dc5;
-  for (const file of files) {
-    for (let i = 0; i < file.path.length; i += 1) {
-      hash ^= file.path.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193);
-    }
-    hash ^= file.size;
-    hash = Math.imul(hash, 0x01000193);
-    hash ^= file.mtime >>> 0;
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return `${files.length}:${hash >>> 0}`;
+interface FileMeta {
+  size: number;
+  mtime: number;
+}
+
+export interface WorkspaceChange {
+  added: string[];
+  removed: string[];
+  modified: string[];
+}
+
+export function workspaceChangeCount(change: WorkspaceChange): number {
+  return change.added.length + change.removed.length + change.modified.length;
 }
 
 export class FsAccessProvider implements WorkspaceProvider {
@@ -266,7 +265,8 @@ export class FsAccessProvider implements WorkspaceProvider {
   private readonly handles = new Map<string, FileSystemFileHandle>();
   private gitIndex: Map<string, GitIndexEntry> | null = null;
   private hasGit = false;
-  private loadedSignature = '';
+  private readonly loadedMeta = new Map<string, FileMeta>();
+  private loaded = false;
 
   constructor(root: FileSystemDirectoryHandle) {
     this.root = root;
@@ -295,14 +295,18 @@ export class FsAccessProvider implements WorkspaceProvider {
       readGitIndex(this.root),
     ]);
     if (scanned.length === 0) {
+      this.handles.clear();
+      this.loadedMeta.clear();
       throw new Error('No supported text files were found in this folder.');
     }
 
     this.gitIndex = index;
     this.hasGit = index !== null;
+    this.loaded = true;
 
     scanned.sort((a, b) => a.path.localeCompare(b.path));
-    this.loadedSignature = signatureOf(scanned);
+    this.handles.clear();
+    this.loadedMeta.clear();
 
     const groupsByPath = new Map<string, Group>();
     const panels: Panel[] = [];
@@ -349,13 +353,11 @@ export class FsAccessProvider implements WorkspaceProvider {
       panels.push(panel);
       group.panelIds.push(panel.id);
       this.handles.set(file.path, file.handle);
+      this.loadedMeta.set(file.path, { size: file.size, mtime: file.mtime });
     }
 
     if (index) {
-      const meta = new Map(
-        scanned.map((file) => [file.path, { size: file.size, mtime: file.mtime }]),
-      );
-      applyGitStatus(panels, meta, index);
+      applyGitStatus(panels, this.loadedMeta, index);
     }
 
     onProgress?.({ phase: 'layout', files: panels.length, folders: groupList.length });
@@ -371,14 +373,51 @@ export class FsAccessProvider implements WorkspaceProvider {
 
   /**
    * Walks metadata only (no file contents) to detect files added, removed, or
-   * changed since the last load. Used for quiet sync when the window regains
-   * focus.
+   * changed since the last load. Used for live sync while the window is open.
    */
-  async changedSinceLoad(): Promise<boolean> {
-    if (!this.loadedSignature) return true;
+  async detectChanges(): Promise<WorkspaceChange | null> {
+    if (!this.loaded) return null;
     const files = await scanFiles(this.root);
-    files.sort((a, b) => a.path.localeCompare(b.path));
-    return signatureOf(files) !== this.loadedSignature;
+    const next = new Map<string, FileMeta>();
+    for (const file of files) next.set(file.path, { size: file.size, mtime: file.mtime });
+
+    const change: WorkspaceChange = { added: [], removed: [], modified: [] };
+    for (const [path, meta] of next) {
+      const previous = this.loadedMeta.get(path);
+      if (!previous) change.added.push(path);
+      else if (previous.size !== meta.size || previous.mtime !== meta.mtime) {
+        change.modified.push(path);
+      }
+    }
+    for (const path of this.loadedMeta.keys()) {
+      if (!next.has(path)) change.removed.push(path);
+    }
+
+    return workspaceChangeCount(change) > 0 ? change : null;
+  }
+
+  /**
+   * Accepts an external change to one file without rescanning the workspace.
+   * Used when only the open document changed on disk; the editor owns the
+   * content reload. Returns false when the file disappeared or is no longer
+   * part of the workspace, which requires a full refresh.
+   */
+  async acceptFileChange(path: string): Promise<boolean> {
+    const handle = this.handles.get(path);
+    if (!handle) return false;
+    try {
+      const file = await handle.getFile();
+      if (!isTextFile(file.name) || file.size > MAX_FILE_SIZE) return false;
+      this.loadedMeta.set(path, { size: file.size, mtime: file.lastModified });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private trackFile(path: string, file: File): void {
+    if (!isTextFile(file.name) || file.size > MAX_FILE_SIZE) return;
+    this.loadedMeta.set(path, { size: file.size, mtime: file.lastModified });
   }
 
   async stat(path: string): Promise<{ mtime: number; size: number } | null> {
@@ -420,6 +459,7 @@ export class FsAccessProvider implements WorkspaceProvider {
     } finally {
       await writable.close();
     }
+    this.trackFile(path, await handle.getFile());
   }
 
   async createFile(path: string, content = ''): Promise<void> {
@@ -434,12 +474,14 @@ export class FsAccessProvider implements WorkspaceProvider {
       await writable.close();
     }
     this.handles.set(path, handle);
+    this.trackFile(path, await handle.getFile());
   }
 
   async deleteFile(path: string): Promise<void> {
     const { directory, name } = await this.resolveParent(path, false);
     await directory.removeEntry(name);
     this.handles.delete(path);
+    this.loadedMeta.delete(path);
   }
 
   async renameFile(from: string, to: string): Promise<void> {
@@ -453,6 +495,7 @@ export class FsAccessProvider implements WorkspaceProvider {
     await this.createFile(to, content);
     await sourceDirectory.removeEntry(sourceName);
     this.handles.delete(from);
+    this.loadedMeta.delete(from);
   }
 
   private async resolveParent(
