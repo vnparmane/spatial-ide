@@ -62,6 +62,7 @@ const TEMPLATE = `
     <span><kbd>ctrl</kbd>+<kbd>wheel</kbd> zoom</span>
     <span><kbd>space</kbd>+<kbd>drag</kbd> pan</span>
     <span><kbd>dbl-click</kbd> edit</span>
+    <span><kbd>right-click</kbd> menu</span>
     <span><kbd>n</kbd> new file</span>
     <span><kbd>F2</kbd> rename</span>
     <span><kbd>del</kbd> delete</span>

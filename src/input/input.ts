@@ -19,6 +19,8 @@ export class InputController {
   selectedId = -1;
   /** Invoked when a panel is activated for editing (double-click). */
   onActivate: ((panel: Panel) => void) | null = null;
+  /** Invoked on right-click with the panel under the cursor, if any. */
+  onPanelContextMenu: ((panel: Panel | null, x: number, y: number) => void) | null = null;
 
   private readonly canvas: HTMLCanvasElement;
   private camera: Camera;
@@ -215,6 +217,10 @@ export class InputController {
 
   private onContextMenu = (event: MouseEvent): void => {
     event.preventDefault();
+    const [sx, sy] = this.localPoint(event);
+    const panel = this.pick(sx, sy);
+    if (panel) this.selectedId = panel.id;
+    this.onPanelContextMenu?.(panel, event.clientX, event.clientY);
   };
 
   private onKeyDown = (event: KeyboardEvent): void => {

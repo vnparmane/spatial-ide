@@ -9,6 +9,7 @@ import { Renderer } from './render/renderer';
 import { loadSession, saveSession } from './session/session';
 import { TokenStore } from './tokens/tokenStore';
 import { createCommandPalette } from './ui/commandPalette';
+import { createContextMenu, type ContextMenuEntry } from './ui/contextMenu';
 import { createHud } from './ui/hud';
 import { createLoadingOverlay } from './ui/loading';
 import { createMinimap } from './ui/minimap';
@@ -226,6 +227,8 @@ const commandPalette = createCommandPalette({
   },
 });
 
+const panelMenu = createContextMenu();
+
 /** Camera flight plus editor mount, shared by double-click and quick-open. */
 function activatePanel(panel: Panel, focus?: EditorFocus): void {
   input.selectedId = panel.id;
@@ -241,6 +244,74 @@ function activatePanel(panel: Panel, focus?: EditorFocus): void {
 
 input.onActivate = activatePanel;
 
+function copyText(text: string): void {
+  void navigator.clipboard.writeText(text).catch((error) => {
+    console.warn('Could not copy to clipboard', error);
+  });
+}
+
+input.onPanelContextMenu = (panel, x, y) => {
+  if (!panel) return;
+  quickOpen.close();
+  search.close();
+  commandPalette.close();
+
+  const isFs = provider instanceof FsAccessProvider;
+  const isOpen = editor.openPanel?.path === panel.path;
+  const entries: ContextMenuEntry[] = [
+    {
+      label: 'Open in editor',
+      shortcut: '↵',
+      run: () => activatePanel(panel),
+    },
+    {
+      label: 'Center on panel',
+      run: () => camera.focusRect(panel, 72),
+    },
+    { separator: true },
+    {
+      label: 'New file here…',
+      shortcut: 'n',
+      disabled: !isFs,
+      run: createNewFile,
+    },
+    {
+      label: 'Rename…',
+      shortcut: 'F2',
+      disabled: !isFs,
+      run: renameSelectedFile,
+    },
+    {
+      label: 'Delete',
+      shortcut: 'Del',
+      disabled: !isFs,
+      danger: true,
+      run: deleteSelectedFile,
+    },
+    { separator: true },
+    {
+      label: 'Copy path',
+      run: () => copyText(panel.path),
+    },
+    {
+      label: 'Copy file name',
+      run: () => copyText(panel.name),
+    },
+    { separator: true },
+    {
+      label: 'Refresh workspace',
+      disabled: !isFs,
+      run: () => {
+        void refreshWorkspace();
+      },
+    },
+  ];
+  if (isOpen) {
+    entries.push({ label: 'Close editor', shortcut: 'esc', run: () => editor.close() });
+  }
+  panelMenu.open(entries, x, y);
+};
+
 window.addEventListener(
   'keydown',
   (event) => {
@@ -249,6 +320,7 @@ window.addEventListener(
     event.preventDefault();
     search.close();
     commandPalette.close();
+    panelMenu.close();
     if (quickOpen.isOpen) quickOpen.close();
     else quickOpen.open();
   },
@@ -263,6 +335,7 @@ window.addEventListener(
     event.preventDefault();
     quickOpen.close();
     commandPalette.close();
+    panelMenu.close();
     if (search.isOpen) search.close();
     else search.open();
   },
@@ -277,6 +350,7 @@ window.addEventListener(
     event.preventDefault();
     quickOpen.close();
     search.close();
+    panelMenu.close();
     if (commandPalette.isOpen) commandPalette.close();
     else commandPalette.open();
   },
@@ -286,7 +360,7 @@ window.addEventListener(
 // File operations only fire from the canvas, never while typing or searching.
 window.addEventListener('keydown', (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-  if (quickOpen.isOpen || commandPalette.isOpen || isEditableTarget(event.target)) return;
+  if (quickOpen.isOpen || commandPalette.isOpen || panelMenu.isOpen || isEditableTarget(event.target)) return;
   if (!(provider instanceof FsAccessProvider)) return;
 
   if (event.key === 'n' || event.key === 'N') {
@@ -694,6 +768,7 @@ if (import.meta.env.DEV) {
     quickOpen,
     search,
     commandPalette,
+    panelMenu,
     openFolder,
     openDirectoryHandle,
     bootStoredFolder,
