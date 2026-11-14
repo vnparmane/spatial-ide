@@ -34,7 +34,7 @@ import {
 import { createMockWorkspace } from './workspace/mock';
 import { MockProvider } from './workspace/mockProvider';
 import type { ScanProgress, WorkspaceProvider } from './workspace/provider';
-import type { Panel, Workspace } from './workspace/types';
+import type { Bounds, Panel, Workspace } from './workspace/types';
 
 const canvas = document.getElementById('canvas');
 if (!(canvas instanceof HTMLCanvasElement)) {
@@ -144,7 +144,9 @@ const search = createSearch({
 const commandPalette = createCommandPalette({
   getCommands: () => {
     const isFs = provider instanceof FsAccessProvider;
-    const hasSelection = input.selectedId >= 0;
+    const selectionCount = input.selectionCount;
+    const hasSelection = selectionCount > 0;
+    const singleSelection = selectionCount === 1;
     const handle = storedHandle;
     return [
       {
@@ -185,12 +187,12 @@ const commandPalette = createCommandPalette({
         id: 'rename-file',
         title: 'Rename selected file…',
         shortcut: 'F2',
-        enabled: () => isFs && hasSelection,
+        enabled: () => isFs && singleSelection,
         run: renameSelectedFile,
       },
       {
         id: 'delete-file',
-        title: 'Delete selected file',
+        title: selectionCount > 1 ? `Delete ${selectionCount} selected files` : 'Delete selected file',
         shortcut: 'del',
         enabled: () => isFs && hasSelection,
         run: deleteSelectedFile,
@@ -245,19 +247,14 @@ const commandPalette = createCommandPalette({
         id: 'center-selection',
         title: 'Center on selection',
         enabled: () => hasSelection,
-        run: () => {
-          const panel = input.selectedId >= 0 ? workspace.panels[input.selectedId] : null;
-          if (panel) camera.focusRect(panel, 72);
-        },
+        run: focusSelection,
       },
       {
         id: 'clear-selection',
         title: 'Clear selection',
         shortcut: 'esc',
         enabled: () => hasSelection,
-        run: () => {
-          input.selectedId = -1;
-        },
+        run: () => input.clearSelection(),
       },
     ];
   },
@@ -265,9 +262,35 @@ const commandPalette = createCommandPalette({
 
 const panelMenu = createContextMenu();
 
+/** World rect spanning every selected panel, or null when nothing is selected. */
+function selectionBounds(): Bounds | null {
+  const ids = input.selectedIds;
+  if (ids.length === 0) return null;
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const id of ids) {
+    const panel = workspace.panels[id];
+    if (!panel) continue;
+    minX = Math.min(minX, panel.x);
+    minY = Math.min(minY, panel.y);
+    maxX = Math.max(maxX, panel.x + panel.w);
+    maxY = Math.max(maxY, panel.y + panel.h);
+  }
+  if (minX === Infinity) return null;
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+function focusSelection(): void {
+  const bounds = selectionBounds();
+  if (bounds) camera.focusRect(bounds, 72);
+}
+
 /** Camera flight plus editor mount, shared by double-click and quick-open. */
 function activatePanel(panel: Panel, focus?: EditorFocus): void {
-  input.selectedId = panel.id;
+  input.selectOnly(panel.id);
   camera.focusRect(panel, 72);
 
   // Guarantee the panel crosses the edit LOD even when it is short or narrow.
@@ -312,12 +335,14 @@ function copyText(text: string): void {
 
 input.onPanelContextMenu = (panel, x, y) => {
   if (!panel) return;
+  if (!input.selectedIds.includes(panel.id)) input.selectOnly(panel.id);
   quickOpen.close();
   search.close();
   commandPalette.close();
 
   const isFs = provider instanceof FsAccessProvider;
   const isOpen = editor.openPanel?.path === panel.path;
+  const selectionCount = input.selectionCount;
   const entries: ContextMenuEntry[] = [
     {
       label: 'Open in editor',
@@ -325,24 +350,24 @@ input.onPanelContextMenu = (panel, x, y) => {
       run: () => activatePanel(panel),
     },
     {
-      label: 'Center on panel',
-      run: () => camera.focusRect(panel, 72),
+      label: selectionCount > 1 ? `Center on ${selectionCount} panels` : 'Center on panel',
+      run: () => (selectionCount > 1 ? focusSelection() : camera.focusRect(panel, 72)),
     },
     { separator: true },
     {
       label: 'New file here…',
       shortcut: 'n',
       disabled: !isFs,
-      run: createNewFile,
+      run: () => createNewFile(panel.path),
     },
     {
       label: 'Rename…',
       shortcut: 'F2',
-      disabled: !isFs,
+      disabled: !isFs || selectionCount !== 1,
       run: renameSelectedFile,
     },
     {
-      label: 'Delete',
+      label: selectionCount > 1 ? `Delete ${selectionCount} files` : 'Delete',
       shortcut: 'Del',
       disabled: !isFs,
       danger: true,
@@ -465,7 +490,8 @@ restoreOrFit(workspace);
 
 interface ApplyView {
   camera: { x: number; y: number; zoom: number };
-  selectedPath: string | null;
+  selectedPaths: string[];
+  primaryPath?: string | null;
   focusPath?: string;
   /** Reopens this file after the rescan, e.g. manual Refresh. */
   openPath?: string | null;
@@ -505,10 +531,13 @@ function applyWorkspace(
   camera.tzoom = view.camera.zoom;
   camera.snap();
 
-  const selected = view.selectedPath
-    ? workspace.panels.find((panel) => panel.path === view.selectedPath)
-    : null;
-  input.selectedId = selected ? selected.id : -1;
+  const selectedIds = view.selectedPaths
+    .map((path) => workspace.panels.find((panel) => panel.path === path)?.id ?? -1)
+    .filter((id) => id >= 0);
+  const primaryId = view.primaryPath
+    ? (workspace.panels.find((panel) => panel.path === view.primaryPath)?.id ?? -1)
+    : (selectedIds[selectedIds.length - 1] ?? -1);
+  input.setSelection(selectedIds, primaryId);
 
   const openPath = view.focusPath ?? view.openPath ?? null;
   if (openPath) {
@@ -605,7 +634,10 @@ async function refreshWorkspace(
   refreshing = true;
   const view: ApplyView = {
     camera: camera.state(),
-    selectedPath:
+    selectedPaths: input.selectedIds
+      .map((id) => workspace.panels[id]?.path)
+      .filter((path): path is string => Boolean(path)),
+    primaryPath:
       input.selectedId >= 0 ? (workspace.panels[input.selectedId]?.path ?? null) : null,
     focusPath,
     openPath: editor.openPanel?.path ?? null,
@@ -715,21 +747,25 @@ function normalizeFilePath(raw: string): string | null {
   return path;
 }
 
-function defaultNewFilePath(): string {
-  const selected = input.selectedId >= 0 ? workspace.panels[input.selectedId] : null;
+function defaultNewFilePath(basePath?: string): string {
+  const selected = basePath
+    ? (workspace.panels.find((panel) => panel.path === basePath) ?? null)
+    : input.selectedId >= 0
+      ? workspace.panels[input.selectedId]
+      : null;
   if (!selected) return 'untitled.ts';
   const slash = selected.path.lastIndexOf('/');
   return slash < 0 ? 'untitled.ts' : `${selected.path.slice(0, slash + 1)}untitled.ts`;
 }
 
-async function createNewFile(): Promise<void> {
+async function createNewFile(basePath?: string): Promise<void> {
   const currentProvider = provider;
   if (!(currentProvider instanceof FsAccessProvider)) {
     window.alert('Open a folder before creating files.');
     return;
   }
 
-  const raw = window.prompt('New file path', defaultNewFilePath());
+  const raw = window.prompt('New file path', defaultNewFilePath(basePath));
   if (raw === null) return;
   const path = normalizeFilePath(raw);
   if (!path) {
@@ -749,6 +785,10 @@ async function renameSelectedFile(): Promise<void> {
   const currentProvider = provider;
   if (!(currentProvider instanceof FsAccessProvider)) return;
 
+  if (input.selectionCount !== 1) {
+    window.alert('Select a single file to rename.');
+    return;
+  }
   const panel = input.selectedId >= 0 ? workspace.panels[input.selectedId] : null;
   if (!panel) {
     window.alert('Select a file panel to rename.');
@@ -778,24 +818,49 @@ async function deleteSelectedFile(): Promise<void> {
   const currentProvider = provider;
   if (!(currentProvider instanceof FsAccessProvider)) return;
 
-  const panel = input.selectedId >= 0 ? workspace.panels[input.selectedId] : null;
-  if (!panel) {
+  const panels = input.selectedIds
+    .map((id) => workspace.panels[id])
+    .filter((panel): panel is Panel => Boolean(panel));
+  if (panels.length === 0) {
     window.alert('Select a file panel to delete.');
     return;
   }
 
-  const message = panel.dirty
-    ? `Delete ${panel.path}? Unsaved changes will be lost.`
-    : `Delete ${panel.path}?`;
+  const dirtyCount = panels.filter((panel) => panel.dirty).length;
+  let message: string;
+  if (panels.length === 1) {
+    message = panels[0].dirty
+      ? `Delete ${panels[0].path}? Unsaved changes will be lost.`
+      : `Delete ${panels[0].path}?`;
+  } else {
+    const preview = panels.slice(0, 4).map((panel) => panel.path).join('\n');
+    const more = panels.length > 4 ? `\n…and ${panels.length - 4} more` : '';
+    const dirty =
+      dirtyCount > 0
+        ? `\n\nUnsaved changes in ${dirtyCount} file${dirtyCount === 1 ? '' : 's'} will be lost.`
+        : '';
+    message = `Delete ${panels.length} files?\n\n${preview}${more}${dirty}`;
+  }
   if (!window.confirm(message)) return;
 
-  if (editor.openPanel?.path === panel.path) editor.close();
-  editor.discardDraft(panel.path);
-  try {
-    await currentProvider.deleteFile(panel.path);
-    await refreshWorkspace();
-  } catch (error) {
-    window.alert(error instanceof Error ? error.message : String(error));
+  const openPath = editor.openPanel?.path ?? null;
+  if (openPath && panels.some((panel) => panel.path === openPath)) editor.close();
+
+  const failures: string[] = [];
+  for (const panel of panels) {
+    editor.discardDraft(panel.path);
+    try {
+      await currentProvider.deleteFile(panel.path);
+    } catch (error) {
+      failures.push(
+        `${panel.path}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  await refreshWorkspace();
+  if (failures.length > 0) {
+    window.alert(`Could not delete:\n${failures.join('\n')}`);
   }
 }
 
@@ -895,7 +960,12 @@ function frame(now: number): void {
   }
 
   const start = performance.now();
-  const stats = renderer.render(camera, input.hoveredId, input.selectedId);
+  const stats = renderer.render(
+    camera,
+    input.hoveredId,
+    input.selectedIds,
+    input.selectedId,
+  );
   const elapsed = performance.now() - start;
   frameMs += (elapsed - frameMs) * 0.1;
 
@@ -918,6 +988,7 @@ function frame(now: number): void {
       cameraX: camera.x,
       cameraY: camera.y,
       selected,
+      selectedCount: input.selectionCount,
       hovered,
     });
   }

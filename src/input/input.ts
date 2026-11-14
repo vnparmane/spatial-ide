@@ -6,17 +6,32 @@ import type { Group, Panel, Workspace } from '../workspace/types';
 
 /** Screen-space distance before a press on a panel becomes a drag. */
 const DRAG_THRESHOLD_PX = 3;
+/** Screen-space distance before a press on empty canvas becomes a marquee. */
+const MARQUEE_THRESHOLD_PX = 3;
 
 interface DragState {
   pointerId: number;
-  kind: 'panel' | 'group';
+  kind: 'panels' | 'group';
   startX: number;
   startY: number;
   moved: boolean;
-  group: Group;
+  /** Frames that must be refitted while panels move. */
+  groups: Group[];
   originPanels: { id: number; x: number; y: number }[];
   originGroupX: number;
   originGroupY: number;
+  /** Collapses a multi-selection to this panel when the press ends without moving. */
+  collapseTo: number | null;
+}
+
+interface MarqueeState {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  additive: boolean;
+  base: number[];
+  basePrimary: number;
+  moved: boolean;
 }
 
 export function isEditableTarget(target: EventTarget | null): boolean {
@@ -29,11 +44,11 @@ export function isEditableTarget(target: EventTarget | null): boolean {
 
 /**
  * Canvas input: wheel pan, ctrl/cmd+wheel zoom-to-cursor, space/middle drag pan,
- * click selection, double-click camera flight, and keyboard navigation.
+ * click and marquee selection, panel/group dragging, and keyboard navigation.
  */
 export class InputController {
   hoveredId = -1;
-  selectedId = -1;
+  hoveredGroupId = -1;
   /** Invoked when a panel is activated for editing (double-click). */
   onActivate: ((panel: Panel) => void) | null = null;
   /** Invoked on right-click with the panel under the cursor, if any. */
@@ -41,15 +56,19 @@ export class InputController {
   /** Invoked after a manual move commits, with the moved panel paths. */
   onLayoutCommit: ((paths: string[]) => void) | null = null;
 
-  hoveredGroupId = -1;
-
   private readonly canvas: HTMLCanvasElement;
+  private readonly marqueeEl: HTMLDivElement;
   private camera: Camera;
   private workspace: Workspace;
   private spatial: SpatialHash;
 
+  /** Every selected panel. The primary selection is the anchor for commands. */
+  private selection = new Set<number>();
+  private primaryId = -1;
+
   private panning = false;
   private drag: DragState | null = null;
+  private marquee: MarqueeState | null = null;
   private spaceDown = false;
   private pointerId = -1;
   private lastX = 0;
@@ -68,6 +87,12 @@ export class InputController {
     this.camera = camera;
     this.workspace = workspace;
     this.spatial = spatial;
+
+    this.marqueeEl = document.createElement('div');
+    this.marqueeEl.className = 'marquee';
+    this.marqueeEl.hidden = true;
+    document.body.appendChild(this.marqueeEl);
+
     canvas.addEventListener('pointerdown', this.onPointerDown);
     canvas.addEventListener('pointermove', this.onPointerMove);
     canvas.addEventListener('pointerup', this.onPointerUp);
@@ -81,13 +106,88 @@ export class InputController {
     window.addEventListener('blur', this.onBlur);
   }
 
+  /** Primary selected panel, or -1. Kept for single-selection callers. */
+  get selectedId(): number {
+    if (this.primaryId >= 0 && this.selection.has(this.primaryId)) return this.primaryId;
+    const first = this.selection.values().next();
+    return first.done ? -1 : first.value;
+  }
+
+  set selectedId(id: number) {
+    if (id >= 0 && this.workspace.panels[id]) this.selectOnly(id);
+    else this.clearSelection();
+  }
+
+  /** All selected panel ids in ascending order. */
+  get selectedIds(): number[] {
+    return [...this.selection].sort((a, b) => a - b);
+  }
+
+  get selectionCount(): number {
+    return this.selection.size;
+  }
+
+  selectOnly(id: number): void {
+    if (id < 0 || !this.workspace.panels[id]) {
+      this.clearSelection();
+      return;
+    }
+    this.selection.clear();
+    this.selection.add(id);
+    this.primaryId = id;
+  }
+
+  selectMany(ids: readonly number[], additive = false): void {
+    if (!additive) this.selection.clear();
+    let primary = -1;
+    for (const id of ids) {
+      if (id < 0 || !this.workspace.panels[id]) continue;
+      this.selection.add(id);
+      primary = id;
+    }
+    if (primary >= 0) {
+      this.primaryId = primary;
+    } else if (!additive) {
+      this.primaryId = -1;
+    } else if (!this.selection.has(this.primaryId)) {
+      this.primaryId = this.selectedId;
+    }
+  }
+
+  /** Replaces the selection while preserving a specific primary panel. */
+  setSelection(ids: readonly number[], primary: number): void {
+    this.selection.clear();
+    for (const id of ids) {
+      if (id >= 0 && this.workspace.panels[id]) this.selection.add(id);
+    }
+    this.primaryId = this.selection.has(primary) ? primary : this.selectedId;
+  }
+
+  toggleSelection(id: number): void {
+    if (id < 0 || !this.workspace.panels[id]) return;
+    if (this.selection.has(id)) {
+      this.selection.delete(id);
+      if (this.primaryId === id) this.primaryId = this.selectedId;
+    } else {
+      this.selection.add(id);
+      this.primaryId = id;
+    }
+  }
+
+  clearSelection(): void {
+    this.selection.clear();
+    this.primaryId = -1;
+  }
+
   setWorkspace(workspace: Workspace, spatial: SpatialHash): void {
     this.workspace = workspace;
     this.spatial = spatial;
     this.hoveredId = -1;
     this.hoveredGroupId = -1;
-    this.selectedId = -1;
+    this.clearSelection();
     this.drag = null;
+    this.marquee = null;
+    this.marqueeEl.hidden = true;
     this.panning = false;
     this.pointerId = -1;
     this.refreshCursor();
@@ -148,7 +248,9 @@ export class InputController {
   }
 
   private refreshCursor(): void {
-    if (this.panning || (this.drag?.moved ?? false)) {
+    if (this.marquee) {
+      this.canvas.style.cursor = 'crosshair';
+    } else if (this.panning || (this.drag?.moved ?? false)) {
       this.canvas.style.cursor = 'grabbing';
     } else if (this.spaceDown) {
       this.canvas.style.cursor = 'grab';
@@ -171,36 +273,93 @@ export class InputController {
     this.refreshCursor();
   }
 
-  private beginDrag(
+  private capturePointer(pointerId: number): void {
+    this.pointerId = pointerId;
+    try {
+      this.canvas.setPointerCapture(pointerId);
+    } catch {
+      // Synthetic pointers cannot always be captured.
+    }
+  }
+
+  private beginPanelDrag(
+    event: PointerEvent,
+    sx: number,
+    sy: number,
+    panel: Panel,
+    collapseTo: number | null,
+  ): void {
+    const ids = this.selection.has(panel.id) ? this.selectedIds : [panel.id];
+    const panels = ids
+      .map((id) => this.workspace.panels[id])
+      .filter((candidate): candidate is Panel => Boolean(candidate));
+
+    const groups: Group[] = [];
+    for (const member of panels) {
+      const group = this.workspace.groups.find((candidate) => candidate.id === member.groupId);
+      if (group && !groups.includes(group)) groups.push(group);
+    }
+    if (groups.length === 0) return;
+
+    this.drag = {
+      pointerId: event.pointerId,
+      kind: 'panels',
+      startX: sx,
+      startY: sy,
+      moved: false,
+      groups,
+      originPanels: panels.map((member) => ({ id: member.id, x: member.x, y: member.y })),
+      originGroupX: 0,
+      originGroupY: 0,
+      collapseTo,
+    };
+    this.capturePointer(event.pointerId);
+    this.refreshCursor();
+  }
+
+  private beginGroupDrag(
     event: PointerEvent,
     sx: number,
     sy: number,
     group: Group,
-    panel: Panel | null,
   ): void {
-    const members = panel
-      ? [panel]
-      : group.panelIds
-          .map((id) => this.workspace.panels[id])
-          .filter((candidate): candidate is Panel => Boolean(candidate));
+    const panels = group.panelIds
+      .map((id) => this.workspace.panels[id])
+      .filter((candidate): candidate is Panel => Boolean(candidate));
 
     this.drag = {
       pointerId: event.pointerId,
-      kind: panel ? 'panel' : 'group',
+      kind: 'group',
       startX: sx,
       startY: sy,
       moved: false,
-      group,
-      originPanels: members.map((member) => ({ id: member.id, x: member.x, y: member.y })),
+      groups: [group],
+      originPanels: panels.map((member) => ({ id: member.id, x: member.x, y: member.y })),
       originGroupX: group.x,
       originGroupY: group.y,
+      collapseTo: null,
     };
-    this.pointerId = event.pointerId;
-    try {
-      this.canvas.setPointerCapture(event.pointerId);
-    } catch {
-      // Synthetic pointers cannot always be captured.
-    }
+    this.capturePointer(event.pointerId);
+    this.refreshCursor();
+  }
+
+  private beginMarquee(
+    event: PointerEvent,
+    sx: number,
+    sy: number,
+    additive: boolean,
+  ): void {
+    this.marquee = {
+      pointerId: event.pointerId,
+      startX: sx,
+      startY: sy,
+      additive,
+      base: this.selectedIds,
+      basePrimary: this.selectedId,
+      moved: false,
+    };
+    this.capturePointer(event.pointerId);
+    this.marqueeEl.hidden = true;
     this.refreshCursor();
   }
 
@@ -215,21 +374,37 @@ export class InputController {
 
     if (event.button !== 0) return;
 
+    const additive = event.shiftKey || event.ctrlKey || event.metaKey;
     const panel = this.pick(sx, sy);
+
     if (panel) {
-      this.selectedId = panel.id;
-      const group = this.workspace.groups.find((candidate) => candidate.id === panel.groupId);
-      if (group) this.beginDrag(event, sx, sy, group, panel);
-      this.refreshCursor();
-    } else {
-      const group = this.pickGroupHeader(sx, sy);
-      if (group) {
-        this.selectedId = -1;
-        this.beginDrag(event, sx, sy, group, null);
+      if (additive) {
+        this.toggleSelection(panel.id);
+        if (this.selection.has(panel.id)) this.beginPanelDrag(event, sx, sy, panel, null);
       } else {
-        this.selectedId = -1;
-        this.beginPan(event, sx, sy);
+        const collapseTo =
+          this.selection.has(panel.id) && this.selection.size > 1 ? panel.id : null;
+        if (!this.selection.has(panel.id)) this.selectOnly(panel.id);
+        this.beginPanelDrag(event, sx, sy, panel, collapseTo);
       }
+      this.refreshCursor();
+      event.preventDefault();
+      return;
+    }
+
+    const group = this.pickGroupHeader(sx, sy);
+    if (group) {
+      this.clearSelection();
+      this.beginGroupDrag(event, sx, sy, group);
+      event.preventDefault();
+      return;
+    }
+
+    if (event.shiftKey) {
+      this.beginMarquee(event, sx, sy, event.ctrlKey || event.metaKey);
+    } else {
+      this.clearSelection();
+      this.beginPan(event, sx, sy);
     }
     event.preventDefault();
   };
@@ -254,13 +429,91 @@ export class InputController {
     }
 
     if (drag.kind === 'group') {
-      drag.group.x = drag.originGroupX + dx;
-      drag.group.y = drag.originGroupY + dy;
+      const group = drag.groups[0];
+      group.x = drag.originGroupX + dx;
+      group.y = drag.originGroupY + dy;
     } else {
-      fitGroupBounds(drag.group, this.workspace.panels);
+      for (const group of drag.groups) {
+        fitGroupBounds(group, this.workspace.panels);
+      }
     }
 
     this.workspace.bounds = fitWorkspaceBounds(this.workspace.groups);
+    this.refreshCursor();
+  }
+
+  private updateMarquee(sx: number, sy: number): void {
+    const marquee = this.marquee;
+    if (!marquee) return;
+
+    if (!marquee.moved) {
+      if (Math.hypot(sx - marquee.startX, sy - marquee.startY) < MARQUEE_THRESHOLD_PX) return;
+      marquee.moved = true;
+    }
+
+    const left = Math.min(marquee.startX, sx);
+    const top = Math.min(marquee.startY, sy);
+    const width = Math.abs(sx - marquee.startX);
+    const height = Math.abs(sy - marquee.startY);
+
+    const rect = this.canvas.getBoundingClientRect();
+    this.marqueeEl.hidden = false;
+    this.marqueeEl.style.left = `${rect.left + left}px`;
+    this.marqueeEl.style.top = `${rect.top + top}px`;
+    this.marqueeEl.style.width = `${width}px`;
+    this.marqueeEl.style.height = `${height}px`;
+
+    const [worldAX, worldAY] = this.camera.screenToWorld(left, top);
+    const [worldBX, worldBY] = this.camera.screenToWorld(left + width, top + height);
+    const world = {
+      x: Math.min(worldAX, worldBX),
+      y: Math.min(worldAY, worldBY),
+      w: Math.abs(worldBX - worldAX),
+      h: Math.abs(worldBY - worldAY),
+    };
+
+    const hits: number[] = [];
+    for (const index of this.spatial.query(world.x, world.y, world.w, world.h)) {
+      const panel = this.workspace.panels[index];
+      if (!panel) continue;
+      if (panel.x + panel.w < world.x || panel.x > world.x + world.w) continue;
+      if (panel.y + panel.h < world.y || panel.y > world.y + world.h) continue;
+      hits.push(panel.id);
+    }
+    hits.sort((a, b) => a - b);
+
+    const next = marquee.additive
+      ? new Set<number>([...marquee.base, ...hits])
+      : new Set<number>(hits);
+
+    let same = next.size === this.selection.size;
+    if (same) {
+      for (const id of next) {
+        if (!this.selection.has(id)) {
+          same = false;
+          break;
+        }
+      }
+    }
+    if (!same) this.selection = next;
+
+    if (hits.length > 0) {
+      this.primaryId = hits[hits.length - 1];
+    } else if (!this.selection.has(this.primaryId)) {
+      this.primaryId = this.selectedId;
+    }
+  }
+
+  private cancelMarquee(restore: boolean): void {
+    const marquee = this.marquee;
+    if (!marquee) return;
+    this.marquee = null;
+    this.marqueeEl.hidden = true;
+    if (this.canvas.hasPointerCapture(marquee.pointerId)) {
+      this.canvas.releasePointerCapture(marquee.pointerId);
+    }
+    if (this.pointerId === marquee.pointerId) this.pointerId = -1;
+    if (restore) this.setSelection(marquee.base, marquee.basePrimary);
     this.refreshCursor();
   }
 
@@ -269,6 +522,11 @@ export class InputController {
 
     if (this.drag && event.pointerId === this.drag.pointerId) {
       this.updateDrag(sx, sy);
+      return;
+    }
+
+    if (this.marquee && event.pointerId === this.marquee.pointerId) {
+      this.updateMarquee(sx, sy);
       return;
     }
 
@@ -305,7 +563,25 @@ export class InputController {
           if (panel) paths.push(panel.path);
         }
         this.onLayoutCommit?.(paths);
+      } else if (drag.collapseTo !== null) {
+        this.selectOnly(drag.collapseTo);
       }
+
+      const [sx, sy] = this.localPoint(event);
+      this.updateHover(sx, sy);
+      this.refreshCursor();
+      return;
+    }
+
+    if (this.marquee && event.pointerId === this.marquee.pointerId) {
+      const marquee = this.marquee;
+      this.marquee = null;
+      this.marqueeEl.hidden = true;
+      this.pointerId = -1;
+      if (this.canvas.hasPointerCapture(event.pointerId)) {
+        this.canvas.releasePointerCapture(event.pointerId);
+      }
+      if (!marquee.moved && !marquee.additive) this.clearSelection();
 
       const [sx, sy] = this.localPoint(event);
       this.updateHover(sx, sy);
@@ -332,7 +608,7 @@ export class InputController {
   };
 
   private onPointerLeave = (): void => {
-    if (this.panning || this.drag) return;
+    if (this.panning || this.drag || this.marquee) return;
     this.hoveredId = -1;
     this.hoveredGroupId = -1;
     this.refreshCursor();
@@ -360,7 +636,7 @@ export class InputController {
     const [sx, sy] = this.localPoint(event);
     const panel = this.pick(sx, sy);
     if (!panel) return;
-    this.selectedId = panel.id;
+    this.selectOnly(panel.id);
     this.onActivate?.(panel);
   };
 
@@ -368,7 +644,7 @@ export class InputController {
     event.preventDefault();
     const [sx, sy] = this.localPoint(event);
     const panel = this.pick(sx, sy);
-    if (panel) this.selectedId = panel.id;
+    if (panel && !this.selection.has(panel.id)) this.selectOnly(panel.id);
     this.onPanelContextMenu?.(panel, event.clientX, event.clientY);
   };
 
@@ -424,7 +700,11 @@ export class InputController {
         event.preventDefault();
         break;
       case 'Escape':
-        this.selectedId = -1;
+        if (this.marquee) {
+          this.cancelMarquee(true);
+        } else {
+          this.clearSelection();
+        }
         this.hoveredId = -1;
         this.refreshCursor();
         break;
@@ -458,6 +738,7 @@ export class InputController {
       }
     }
 
+    this.cancelMarquee(true);
     this.refreshCursor();
   };
 }

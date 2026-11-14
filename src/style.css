@@ -535,6 +535,20 @@ body {
   touch-action: none;
 }
 
+.marquee {
+  position: fixed;
+  z-index: 8;
+  pointer-events: none;
+  border: 1px solid rgba(110, 168, 254, 0.9);
+  background: rgba(110, 168, 254, 0.12);
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(110, 168, 254, 0.12);
+}
+
+.marquee[hidden] {
+  display: none;
+}
+
 .hud-hints {
   bottom: 14px;
   left: 50%;

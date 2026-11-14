@@ -14,6 +14,7 @@ export interface HudStats {
   cameraY: number;
   lods: [number, number, number, number];
   selected: string | null;
+  selectedCount: number;
   hovered: string | null;
 }
 
@@ -63,6 +64,7 @@ const TEMPLATE = `
     <span><kbd>space</kbd>+<kbd>drag</kbd> pan</span>
     <span><kbd>dbl-click</kbd> edit</span>
     <span><kbd>drag</kbd> move</span>
+    <span><kbd>shift</kbd>+<kbd>click</kbd>/<kbd>drag</kbd> multi</span>
     <span><kbd>right-click</kbd> menu</span>
     <span><kbd>n</kbd> new file</span>
     <span><kbd>F2</kbd> rename</span>
@@ -161,13 +163,19 @@ export function createHud(
       set('l2', formatInt(stats.lods[2]));
       set('l3', formatInt(stats.lods[3]));
 
-      const path = stats.selected ?? stats.hovered ?? 'no selection';
+      const path =
+        stats.selectedCount > 1
+          ? `${stats.selectedCount} panels selected`
+          : (stats.selected ?? stats.hovered ?? 'no selection');
       if (path !== lastPath) {
         lastPath = path;
         set('path', path);
         const element = values.get('path');
         if (element) {
-          element.classList.toggle('is-hover', !stats.selected && Boolean(stats.hovered));
+          element.classList.toggle(
+            'is-hover',
+            stats.selectedCount === 0 && Boolean(stats.hovered),
+          );
         }
       }
     },

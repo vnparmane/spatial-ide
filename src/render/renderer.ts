@@ -174,7 +174,12 @@ export class Renderer {
     this.spatial = spatial;
   }
 
-  render(camera: Camera, hoveredId: number, selectedId: number): RenderStats {
+  render(
+    camera: Camera,
+    hoveredId: number,
+    selectedIds: readonly number[],
+    primaryId = -1,
+  ): RenderStats {
     const gl = this.gl;
     const vw = this.cssWidth;
     const vh = this.cssHeight;
@@ -314,14 +319,31 @@ export class Renderer {
     }
 
     const ringExpand = 2.5 / camera.zoom;
-    const hovered = hoveredId >= 0 ? this.workspace.panels[hoveredId] : undefined;
-    const selected = selectedId >= 0 ? this.workspace.panels[selectedId] : undefined;
+    const selectedSet = new Set(selectedIds);
+    const primary =
+      primaryId >= 0 && selectedSet.has(primaryId)
+        ? this.workspace.panels[primaryId]
+        : undefined;
 
-    if (hovered) {
+    // Secondary selection rings stay quieter; the primary ring draws last so it
+    // wins where selections touch. Offscreen panels are skipped to keep marquee
+    // selections of thousands of panels cheap.
+    for (const id of selectedIds) {
+      if (id === primaryId) continue;
+      const panel = this.workspace.panels[id];
+      if (!panel || !this.intersectsView(panel, worldX, worldY, worldW, worldH)) continue;
+      this.addRing(panel, ringExpand, THEME.selection, 1.5, 0.62);
+    }
+
+    const hovered =
+      hoveredId >= 0 && !selectedSet.has(hoveredId)
+        ? this.workspace.panels[hoveredId]
+        : undefined;
+    if (hovered && this.intersectsView(hovered, worldX, worldY, worldW, worldH)) {
       this.addRing(hovered, ringExpand, THEME.hover, 1.5, 0.8);
     }
-    if (selected) {
-      this.addRing(selected, ringExpand, THEME.selection, 2, 1);
+    if (primary && this.intersectsView(primary, worldX, worldY, worldW, worldH)) {
+      this.addRing(primary, ringExpand, THEME.selection, 2, 1);
     }
 
     const badgeFill: Rgba = [0.014, 0.021, 0.033, 0.88];
@@ -611,6 +633,21 @@ export class Renderer {
         0,
       );
     }
+  }
+
+  private intersectsView(
+    panel: Panel,
+    viewX: number,
+    viewY: number,
+    viewW: number,
+    viewH: number,
+  ): boolean {
+    return (
+      panel.x + panel.w >= viewX &&
+      panel.x <= viewX + viewW &&
+      panel.y + panel.h >= viewY &&
+      panel.y <= viewY + viewH
+    );
   }
 
   private addRing(
