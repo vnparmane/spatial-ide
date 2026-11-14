@@ -1,8 +1,8 @@
 import type { Bounds, Group, Panel } from '../workspace/types';
 
 const PANEL_GAP = 12;
-const GROUP_PAD = 26;
-const GROUP_HEADER = 38;
+export const GROUP_PAD = 26;
+export const GROUP_HEADER = 38;
 const GROUP_MAX_WIDTH = 2200;
 const GROUP_GAP = 84;
 const GROUP_ROW_WIDTH = 24000;

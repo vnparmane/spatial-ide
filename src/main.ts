@@ -3,9 +3,16 @@ import { SemanticStore } from './diagnostics/semanticStore';
 import { DraftStore } from './editor/draftStore';
 import { EditorOverlay, type EditorFocus } from './editor/editorOverlay';
 import { InputController, isEditableTarget } from './input/input';
+import { fitGroupBounds, fitWorkspaceBounds } from './scene/arrangement';
 import { Camera } from './scene/camera';
+import { layoutWorkspace } from './scene/layout';
 import { SpatialHash } from './scene/spatial';
 import { Renderer } from './render/renderer';
+import {
+  clearPanelPositions,
+  loadPanelPositions,
+  savePanelPositions,
+} from './session/layoutStore';
 import { loadSession, saveSession } from './session/session';
 import { TokenStore } from './tokens/tokenStore';
 import { createCommandPalette } from './ui/commandPalette';
@@ -42,7 +49,30 @@ function buildSpatial(workspace: Workspace): SpatialHash {
   return spatial;
 }
 
+/**
+ * Restores manually arranged panel positions for this folder, then refits the
+ * directory frames and workspace bounds around them.
+ */
+function applySavedLayout(target: Workspace): void {
+  const positions = loadPanelPositions(target.rootPath);
+  if (!positions) return;
+
+  let applied = 0;
+  for (const panel of target.panels) {
+    const position = positions[panel.path];
+    if (!position) continue;
+    panel.x = position.x;
+    panel.y = position.y;
+    applied += 1;
+  }
+  if (applied === 0) return;
+
+  for (const group of target.groups) fitGroupBounds(group, target.panels);
+  target.bounds = fitWorkspaceBounds(target.groups);
+}
+
 let workspace = createMockWorkspace();
+applySavedLayout(workspace);
 let spatial = buildSpatial(workspace);
 let provider: WorkspaceProvider = new MockProvider(workspace);
 let storedHandle: FileSystemDirectoryHandle | null = null;
@@ -200,6 +230,12 @@ const commandPalette = createCommandPalette({
         run: () => camera.focusRect(workspace.bounds, 72),
       },
       {
+        id: 'reset-layout',
+        title: 'Reset panel layout',
+        detail: 'Restore the automatic directory grid',
+        run: resetLayout,
+      },
+      {
         id: 'zoom-100',
         title: 'Zoom to 100%',
         shortcut: '1',
@@ -243,6 +279,30 @@ function activatePanel(panel: Panel, focus?: EditorFocus): void {
 }
 
 input.onActivate = activatePanel;
+
+/**
+ * Commits a manual move: rebuilds the picking hash, refits world bounds,
+ * refreshes the overview, and persists the new positions.
+ */
+input.onLayoutCommit = (paths) => {
+  spatial = buildSpatial(workspace);
+  renderer.setSpatial(spatial);
+  input.setSpatial(spatial);
+  workspace.bounds = fitWorkspaceBounds(workspace.groups);
+  minimap.setWorkspace(workspace);
+  savePanelPositions(workspace, paths);
+};
+
+/** Restores the automatic directory grid and forgets the saved arrangement. */
+function resetLayout(): void {
+  clearPanelPositions(workspace.rootPath);
+  workspace.bounds = layoutWorkspace(workspace.panels, workspace.groups);
+  spatial = buildSpatial(workspace);
+  renderer.setSpatial(spatial);
+  input.setSpatial(spatial);
+  minimap.setWorkspace(workspace);
+  camera.focusRect(workspace.bounds, 72);
+}
 
 function copyText(text: string): void {
   void navigator.clipboard.writeText(text).catch((error) => {
@@ -304,6 +364,10 @@ input.onPanelContextMenu = (panel, x, y) => {
       run: () => {
         void refreshWorkspace();
       },
+    },
+    {
+      label: 'Reset panel layout',
+      run: resetLayout,
     },
   ];
   if (isOpen) {
@@ -420,6 +484,7 @@ function applyWorkspace(
   syncDirectoryWatcher();
   structureSyncAt = 0;
   workspace = nextWorkspace;
+  applySavedLayout(workspace);
   spatial = buildSpatial(workspace);
 
   renderer.setWorkspace(workspace, spatial);
@@ -774,6 +839,7 @@ if (import.meta.env.DEV) {
     bootStoredFolder,
     applyWorkspace,
     refreshWorkspace,
+    resetLayout,
     createNewFile,
     renameSelectedFile,
     deleteSelectedFile,

@@ -169,6 +169,11 @@ export class Renderer {
     this.visible.length = 0;
   }
 
+  /** Swaps in a rebuilt spatial hash without clearing LOD hysteresis. */
+  setSpatial(spatial: SpatialHash): void {
+    this.spatial = spatial;
+  }
+
   render(camera: Camera, hoveredId: number, selectedId: number): RenderStats {
     const gl = this.gl;
     const vw = this.cssWidth;
